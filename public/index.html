@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Auto-Monitor</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="app">
+
+    <!-- ── Sidebar ──────────────────────────────────────────────────────── -->
+    <aside id="sidebar">
+      <div class="sidebar-header">
+        <div class="brand">
+          <svg class="brand-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"
+               fill="none" stroke="currentColor" stroke-width="2"
+               stroke-linecap="round" stroke-linejoin="round">
+            <path d="M22 12h-4l-3 9L9 3l-3 9H2"/>
+          </svg>
+          <span>Auto-Monitor</span>
+        </div>
+        <button id="newMonitorBtn" class="btn-icon" title="New monitor">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"
+               fill="none" stroke="currentColor" stroke-width="2.5">
+            <line x1="12" y1="5" x2="12" y2="19"/>
+            <line x1="5" y1="12" x2="19" y2="12"/>
+          </svg>
+        </button>
+      </div>
+
+      <div class="sidebar-label">Monitors</div>
+
+      <nav id="monitorList" class="monitor-list">
+        <div class="empty-list">No monitors yet</div>
+      </nav>
+
+      <div class="sidebar-footer">
+
+        <!-- Model selector -->
+        <div class="settings-block">
+          <div class="settings-header">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"
+                 fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="12" cy="12" r="3"/>
+              <path d="M19.07 4.93a10 10 0 0 1 0 14.14M4.93 4.93a10 10 0 0 0 0 14.14"/>
+            </svg>
+            <span>Model</span>
+          </div>
+          <input id="modelInput" type="text" class="settings-input"
+                 placeholder="e.g. gemma-4-31b-it"
+                 value="gemma-4-31b-it"
+                 autocomplete="off" spellcheck="false" />
+          <p class="settings-hint">Any model available on your API key.</p>
+        </div>
+
+        <div class="settings-divider"></div>
+
+        <!-- API key -->
+        <div class="settings-block">
+          <div class="settings-header">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"
+                 fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="3" y="11" width="18" height="11" rx="2"/>
+              <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+            </svg>
+            <span>Gemini API Key</span>
+          </div>
+          <div class="api-key-row">
+            <input id="apiKeyInput" type="password" placeholder="AIza…"
+                   autocomplete="off" spellcheck="false" />
+            <button id="saveKeyBtn" class="btn-save">Save</button>
+          </div>
+          <div id="keyStatus" class="key-status hidden"></div>
+        </div>
+
+      </div>
+    </aside>
+
+    <!-- ── Main ─────────────────────────────────────────────────────────── -->
+    <main id="main">
+
+      <!-- Chat section -->
+      <section id="chatSection">
+        <div id="messages" class="messages">
+          <!-- Welcome screen (removed once first message is sent) -->
+          <div id="welcomeScreen" class="welcome">
+            <div class="welcome-glyph">
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"
+                   fill="none" stroke="currentColor" stroke-width="1.5"
+                   stroke-linecap="round" stroke-linejoin="round">
+                <path d="M22 12h-4l-3 9L9 3l-3 9H2"/>
+              </svg>
+            </div>
+            <h1>Auto-Monitor</h1>
+            <p>Describe any website or data you want to monitor.<br>
+               Gemini will generate a live crawler and dashboard for you.</p>
+            <div class="suggestion-grid">
+              <button class="suggestion">Track HackerNews top stories</button>
+              <button class="suggestion">Monitor GitHub trending repos today</button>
+              <button class="suggestion">Watch Reddit r/technology posts</button>
+              <button class="suggestion">Get current weather for a city</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Input bar -->
+        <div id="inputArea" class="input-area">
+          <div class="input-row">
+            <textarea id="msgInput"
+              placeholder="Describe what you want to monitor… (Enter to send, Shift+Enter for newline)"
+              rows="1"
+              maxlength="2000"></textarea>
+            <button id="sendBtn" class="btn-send" disabled title="Generate monitor">
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"
+                   fill="none" stroke="currentColor" stroke-width="2.5"
+                   stroke-linecap="round" stroke-linejoin="round">
+                <line x1="22" y1="2" x2="11" y2="13"/>
+                <polygon points="22 2 15 22 11 13 2 9 22 2"/>
+              </svg>
+            </button>
+          </div>
+          <p class="input-hint">
+            Only crawl sites you have permission to access.
+          </p>
+        </div>
+      </section>
+
+      <!-- Dashboard section (hidden until a monitor is opened) -->
+      <section id="dashSection" class="dash-section hidden">
+        <header class="dash-header">
+          <div id="dashTabs" class="dash-tabs"></div>
+          <button id="collapseDash" class="btn-icon btn-collapse" title="Collapse dashboard">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"
+                 fill="none" stroke="currentColor" stroke-width="2">
+              <polyline points="9 18 15 12 9 6"/>
+            </svg>
+          </button>
+        </header>
+        <iframe id="dashFrame" title="Monitor Dashboard"
+                sandbox="allow-scripts allow-same-origin allow-forms"></iframe>
+      </section>
+
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
