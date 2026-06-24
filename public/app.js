@@ -6,8 +6,9 @@
 
 // ── State ─────────────────────────────────────────────────────────────────────
 const state = {
-  apiKey:       localStorage.getItem('poc_gemini_key')   || '',
-  model:        localStorage.getItem('poc_gemini_model') || 'gemma-4-31b-it',
+  apiKey:          localStorage.getItem('poc_gemini_key')      || '',
+  model:           localStorage.getItem('poc_gemini_model')    || 'gemma-4-31b-it',
+  groundingModel:  localStorage.getItem('poc_grounding_model') || 'gemini-flash-latest',
   monitors:     [],   // { crawlerId, name, description, createdAt, hasError }
   activeDashId: null,
   generating:   false,
@@ -21,6 +22,7 @@ const dom = {
   saveKeyBtn:     el('saveKeyBtn'),
   keyStatus:      el('keyStatus'),
   modelInput:     el('modelInput'),
+  groundingInput: el('groundingInput'),
   newMonitorBtn:  el('newMonitorBtn'),
   monitorList:    el('monitorList'),
   messages:       el('messages'),
@@ -44,6 +46,7 @@ function init() {
 
   // Restore saved model
   dom.modelInput.value = state.model;
+  dom.groundingInput.value = state.groundingModel;
 
   // Buttons
   dom.saveKeyBtn    .addEventListener('click',   saveApiKey);
@@ -57,6 +60,10 @@ function init() {
   // Model: persist on change/blur
   dom.modelInput.addEventListener('change', saveModel);
   dom.modelInput.addEventListener('blur',   saveModel);
+
+  // Grounding model: persist on change/blur
+  dom.groundingInput.addEventListener('change', saveModel);
+  dom.groundingInput.addEventListener('blur',   saveModel);
 
   // Input auto-grow + Enter-to-send
   dom.msgInput.addEventListener('input',   onInputChange);
@@ -90,6 +97,11 @@ function saveModel() {
   state.model = m || 'gemma-4-31b-it';
   dom.modelInput.value = state.model;   // normalise empty → default
   localStorage.setItem('poc_gemini_model', state.model);
+
+  const g = dom.groundingInput.value.trim();
+  state.groundingModel = g || 'gemini-flash-latest';
+  dom.groundingInput.value = state.groundingModel;   // normalise empty → default
+  localStorage.setItem('poc_grounding_model', state.groundingModel);
 }
 
 function showKeyStatus(type, text) {
@@ -143,7 +155,7 @@ async function onSend() {
     const res = await fetch('/api/generate', {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ apiKey: state.apiKey, description: text, model: state.model }),
+      body:    JSON.stringify({ apiKey: state.apiKey, description: text, model: state.model, groundingModel: state.groundingModel }),
     });
 
     const data = await res.json();
@@ -238,12 +250,16 @@ function appendErrorMsg(msg) {
   scrollBottom();
 }
 
-function appendCrawlerCard({ crawlerId, name, description, code, verified, attempts, verifyReason, verifyNote, initialData }) {
+function appendCrawlerCard({ crawlerId, name, description, code, verified, attempts, verifyReason, verifyNote, initialData, grounded, sources }) {
   const itemCount = countTopItems(initialData);
   const statusClass = verified ? 'ok' : 'warn';
   const badge = verified
     ? `<span class="verify-badge ok">✓ Verified working</span>`
     : `<span class="verify-badge warn">⚠ Unverified (${esc(verifyReason || 'failed')})</span>`;
+
+  const groundedBadge = grounded
+    ? `<span class="verify-badge grounded">⌖ Grounded</span>`
+    : '';
 
   const statusText = verified
     ? `${verifyNote || 'Verified working.'}${itemCount ? ` (${itemCount} item${itemCount === 1 ? '' : 's'})` : ''}`
@@ -251,6 +267,15 @@ function appendCrawlerCard({ crawlerId, name, description, code, verified, attem
 
   const attemptsText = attempts > 1
     ? `<div class="crawler-card-attempts">Auto-retried ${attempts} time${attempts === 1 ? '' : 's'} to get working data.</div>`
+    : '';
+
+  const srcList = Array.isArray(sources) ? sources.filter(s => s && s.uri) : [];
+  const sourcesText = srcList.length
+    ? `<div class="crawler-card-sources"><span class="sources-label">Sources</span>${
+        srcList.slice(0, 5).map(s =>
+          `<a href="${escAttr(s.uri)}" target="_blank" rel="noopener noreferrer">${esc(s.title || s.uri)}</a>`
+        ).join('')
+      }</div>`
     : '';
 
   const codeBlockId = `code-${crawlerId}`;
@@ -265,10 +290,12 @@ function appendCrawlerCard({ crawlerId, name, description, code, verified, attem
           <div class="crawler-card-pulse ${verified ? '' : 'warn'}"></div>
           <div class="crawler-card-name">${esc(name)}</div>
           ${badge}
+          ${groundedBadge}
         </div>
         <div class="crawler-card-desc">${esc(description)}</div>
         <div class="crawler-card-status ${statusClass}">${esc(statusText)}</div>
         ${attemptsText}
+        ${sourcesText}
         <div class="crawler-card-actions">
           <button class="btn-view-dash" data-id="${crawlerId}" data-name="${escAttr(name)}">
             View Dashboard

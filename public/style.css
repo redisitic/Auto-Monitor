@@ -537,6 +537,7 @@ body {
 }
 .verify-badge.ok   { color: var(--accent); background: var(--accent-glow); border: 1px solid var(--accent-ring); }
 .verify-badge.warn { color: #f59e0b;      background: rgba(245, 158, 11, 0.1); border: 1px solid rgba(245, 158, 11, 0.3); }
+.verify-badge.grounded { color: #60a5fa; background: rgba(96, 165, 250, 0.1); border: 1px solid rgba(96, 165, 250, 0.3); }
 
 .crawler-card-name {
   font-weight: 600;
@@ -570,6 +571,32 @@ body {
   color: var(--text3);
   border-bottom: 1px solid var(--border);
 }
+
+.crawler-card-sources {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  padding: 8px 14px;
+  font-size: 11.5px;
+  border-bottom: 1px solid var(--border);
+}
+.crawler-card-sources .sources-label {
+  color: var(--text3);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 10px;
+}
+.crawler-card-sources a {
+  color: #60a5fa;
+  text-decoration: none;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.crawler-card-sources a:hover { text-decoration: underline; }
 
 .crawler-card-actions {
   display: flex;

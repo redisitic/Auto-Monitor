@@ -57,6 +57,23 @@
           <p class="settings-hint">Any model available on your API key.</p>
         </div>
 
+        <!-- Grounding model selector -->
+        <div class="settings-block">
+          <div class="settings-header">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"
+                 fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="11" cy="11" r="8"/>
+              <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+            </svg>
+            <span>Grounding model</span>
+          </div>
+          <input id="groundingInput" type="text" class="settings-input"
+                 placeholder="e.g. gemini-flash-latest"
+                 value="gemini-flash-latest"
+                 autocomplete="off" spellcheck="false" />
+          <p class="settings-hint">Gemini model used for Google Search grounding (Gemma can't ground). Type "off" to disable and save quota.</p>
+        </div>
+
         <div class="settings-divider"></div>
 
         <!-- API key -->

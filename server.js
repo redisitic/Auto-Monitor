@@ -14,7 +14,7 @@ app.use(express.json({ limit: '10mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
 // ── In-memory store ────────────────────────────────────────────────────────────
-const crawlerStore = new Map(); // crawlerId → crawler entry
+const crawlerStore = new Map();
 
 // ── Gemini system instruction ──────────────────────────────────────────────────
 const SYSTEM_INSTRUCTION = `You are an expert web scraping engineer and monitoring dashboard developer.
@@ -31,16 +31,40 @@ Given a user request about what to monitor, generate two things:
                   await ai.summarize(textOrObject)                  → short plain-text summary
                   await ai.summarize(text, "one sentence, neutral") → summary guided by your instruction
                   await ai.generate("any prompt ...")               → raw model text response
-                Both are ASYNC — always await them. Use ai ONLY when the request needs
-                summarization/analysis (e.g. "summarize today's news"). If asked to summarize,
-                attach the result to your data (e.g. item.summary = await ai.summarize(item.body)).
-                PERFORMANCE: prefer ONE batched ai call over many. Summarize a combined digest, or
-                cap per-item summaries to the first ~8 items. Wrap every ai call in try/catch so an
-                AI hiccup never kills the whole crawl.
+                  await ai.research("question about current data")  → Google-Search-grounded answer
+                       returns { text, sources: [{title,uri}], grounded } — text is informed by a
+                       LIVE web search, sources are citation links. Use it for facts that change
+                       (today's headlines, prices, schedules) or to enrich scraped data. It is
+                       cached server-side for a few minutes, so calling it on every refresh is fine.
+                 ALL are ASYNC — always await them. Use ai ONLY when the request needs
+                 summarization/analysis/current-facts (e.g. "summarize today's news"). If asked to
+                 summarize, attach the result to your data (e.g. item.summary = await ai.summarize(item.body)).
+                 IMPORTANT: ai.summarize/ai.research are ENRICHMENT, not your primary data — you MUST
+                 still scrape/fetch the real underlying items. A result containing ONLY a summary and
+                 no real data counts as a FAILED crawl.
+                 PERFORMANCE: prefer ONE batched ai call over many. Summarize a combined digest, or
+                 cap per-item summaries to the first ~8 items. Wrap every ai call in try/catch so an
+                 AI hiccup never kills the whole crawl.
 • The code MUST end with:  return { ...yourData, scrapedAt: new Date().toISOString() }
 • All returned values must be JSON-serializable (strings, numbers, plain objects, arrays).
-• Prefer official JSON/REST APIs over HTML scraping when available.
-• For HTML scraping add a realistic browser User-Agent header to avoid 403 blocks.
+• STRONGLY prefer official/public JSON/REST APIs over HTML scraping. axios cannot run JavaScript,
+  so it CANNOT scrape single-page-apps or sites behind Cloudflare/bot-protection/login walls.
+• NEVER scrape these (they block bots or render client-side) — use the JSON APIs instead:
+    - Flights/aircraft: do NOT scrape FlightRadar24, FlightAware, Google Flights, or airport sites.
+      USE (public, no key):
+        • https://api.adsb.lol/v2/lat/{lat}/lon/{lon}/dist/{nm}        → live aircraft near a point
+        • https://api.airplanes.live/v2/point/{lat}/{lon}/{nm}         → same, alternate provider
+        • https://opensky-network.org/api/states/all?lamin=&lomin=&lamax=&lomax=  → bounding box
+      Response has an "ac" array; per-aircraft fields: flight (callsign), r (registration), t (type),
+      desc (model), alt_baro (altitude ft), gs (ground speed kt), lat, lon, dst (distance nm).
+      For a city, hardcode its lat/lon (e.g. Mumbai BOM ≈ 19.0896, 72.8656) and a radius like 50 nm.
+    - News/headlines: prefer https://hn.algolia.com/api, public RSS, or official site APIs.
+• For any HTML scraping you DO keep, send realistic browser headers to avoid 403 blocks:
+    { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9' }
+• If the user request involves current/searchable facts and you are unsure of the best endpoint,
+  call await ai.research("...") to look it up live before deciding.
 • Wrap per-item logic in try/catch so one failure does not kill the whole crawl.
 • Limit results to ≤ 20 items to keep responses snappy.
 • NEVER use: require(), import, eval(), process, global, __dirname, __filename, fs, child_process, Buffer.
@@ -69,14 +93,10 @@ Given a user request about what to monitor, generate two things:
 • Rounded corners (8px), subtle shadows, clean professional layout.
 • Use CSS Grid or Flexbox. Make the layout responsive.
 • If the data contains a "summary" field (or per-item "summary"), display it prominently in a highlighted panel/card so the AI summary is the first thing the user sees.
+• If the data contains a "sources" array (objects with title + uri), render them as a compact "Sources" list of clickable links (target="_blank") beneath the summary, so grounded citations are visible.
 • KEEP OUTPUT COMPACT: no decorative comments, no unnecessary blank lines, minimal whitespace in HTML/CSS. Every token counts.`;
 
-// ── Prompt template (delimiter-based, NOT JSON) ────────────────────────────────
-// Returning code/HTML inside JSON strings forces the model to escape every
-// quote, newline and backslash — which it frequently gets wrong, producing
-// unparseable output. A delimiter format lets each section be emitted RAW,
-// eliminating the escaping problem entirely.
-function buildPrompt(description, feedback) {
+function buildPrompt(description, feedback, sourceHint) {
   const retryBlock = feedback ? `
 ⚠️ YOUR PREVIOUS ATTEMPT FAILED AUTOMATED VERIFICATION:
 ${feedback}
@@ -87,10 +107,15 @@ Produce a DIFFERENT, genuinely working solution this time. Critical guidance:
 - Make sure your endpoint/selectors return actual populated data, not empty containers.
 ` : '';
 
+  const sourceBlock = sourceHint ? `
+✅ VERIFIED DATA SOURCE (from a live web search — prefer this strongly):
+${sourceHint}
+` : '';
+
   return `Generate a web crawler and monitoring dashboard for this request:
 
 "${description}"
-${retryBlock}
+${sourceBlock}${retryBlock}
 Respond using EXACTLY this plain-text section format, in this exact order:
 
 ===NAME===
@@ -120,7 +145,6 @@ const SECTION_MARKERS = [
   { key: 'dashboardHtml', tag: '===DASHBOARD===' },
 ];
 
-// Strip an accidental leading/trailing markdown fence from a section body.
 function stripFence(s) {
   return s
     .replace(/^```[a-zA-Z]*\s*\r?\n?/, '')
@@ -128,22 +152,14 @@ function stripFence(s) {
     .trim();
 }
 
-// ── Robust section parser ──────────────────────────────────────────────────────
-// IMPORTANT: some models (especially "thinking" / reasoning models) dump their
-// chain-of-thought into the response, and that prose often *echoes the marker
-// names* (e.g. a bullet list mentioning `===CRAWLER===`). The real, final output
-// is always the LAST block, so we anchor on lastIndexOf() — not indexOf() — to
-// skip past any reasoning that repeats the markers earlier in the text.
 function parseSections(raw) {
   if (!raw || typeof raw !== 'string') throw new Error('Empty response from AI.');
 
-  // Locate the LAST occurrence of every marker, then order by position.
   const found = SECTION_MARKERS
     .map(m => ({ ...m, idx: raw.lastIndexOf(m.tag) }))
     .filter(m => m.idx !== -1)
     .sort((a, b) => a.idx - b.idx);
 
-  // The two essential sections must be present
   const haveCrawler = found.some(f => f.key === 'crawlerCode');
   const haveDash    = found.some(f => f.key === 'dashboardHtml');
   if (!haveCrawler || !haveDash) {
@@ -152,7 +168,6 @@ function parseSections(raw) {
     throw new Error('AI response was not in the expected format (missing CRAWLER or DASHBOARD section). Try again or pick a different model.');
   }
 
-  // Slice content between consecutive markers
   const out = {};
   for (let i = 0; i < found.length; i++) {
     const start = found[i].idx + found[i].tag.length;
@@ -160,8 +175,6 @@ function parseSections(raw) {
     out[found[i].key] = stripFence(raw.slice(start, end).trim());
   }
 
-  // Guard: a corrupt parse can leave the dashboard non-HTML (e.g. leftover
-  // reasoning). Require a recognizable HTML opening so we fail fast & clearly.
   if (!/<!doctype html|<html[\s>]/i.test(out.dashboardHtml)) {
     console.error('[parseSections] Dashboard does not look like HTML. First 300 chars:\n', out.dashboardHtml.slice(0, 300));
     throw new Error('AI produced an invalid dashboard (not valid HTML). Please try again or use a different model.');
@@ -171,25 +184,24 @@ function parseSections(raw) {
 }
 
 // ── Gemini call with auto-retry on 503 ────────────────────────────────────────
-const MAX_RETRIES = 3;
+const GEN_DELAYS = [4000, 8000, 16000];
+const AI_DELAYS  = [1500, 3000];
+const MAX_RETRIES = GEN_DELAYS.length;
 
-async function callWithRetry(model, prompt) {
-  const DELAYS = [4000, 8000, 16000]; // backoff: 4 s, 8 s, 16 s
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+async function callWithRetry(model, prompt, delays = GEN_DELAYS) {
+  const maxRetries = delays.length;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
       return await model.generateContent(prompt);
     } catch (err) {
       const msg = err.message ?? '';
-      // Retry transient server/network failures: 503 (overloaded), 500
-      // (internal error), and low-level fetch/connection errors. Do NOT retry
-      // auth (401/403), quota (429), or model-not-found (404) — those are not
-      // going to fix themselves.
+
       const transient =
         err.status === 503 || err.status === 500 ||
         /\b50[03]\b|Service Unavailable|overloaded|high demand|Internal error|fetch failed|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|network/i.test(msg);
-      if (transient && attempt < MAX_RETRIES) {
-        const delay = DELAYS[attempt];
-        console.log(`[Retry ${attempt + 1}/${MAX_RETRIES}] Transient API failure (${err.status || 'network'}) — waiting ${delay / 1000}s…`);
+      if (transient && attempt < maxRetries) {
+        const delay = delays[attempt];
+        console.log(`[Retry ${attempt + 1}/${maxRetries}] Transient API failure (${err.status || 'network'}) — waiting ${delay / 1000}s…`);
         await new Promise(r => setTimeout(r, delay));
         continue;
       }
@@ -198,62 +210,217 @@ async function callWithRetry(model, prompt) {
   }
 }
 
-// ── Gemini AI helper exposed to generated crawlers ─────────────────────────────
-// Generated crawlers run with `axios`, `cheerio`, and this `ai` object in scope.
-// It lets a crawler call Gemini to summarize / extract / classify the content it
-// scrapes (the user's "summarizing agent"). It deliberately uses NO
-// systemInstruction so it works with any model the user picked, and caps output
-// so summaries stay fast and cheap.
-function createAiHelper(apiKey, modelId) {
+const GROUNDING_MODEL = 'gemini-flash-latest';
+
+const GROUNDING_TTL_MS = 5 * 60_000;
+const groundingCache = new Map();
+
+function groundingCacheGet(key) {
+  const hit = groundingCache.get(key);
+  if (!hit) return null;
+  if (Date.now() - hit.at > GROUNDING_TTL_MS) { groundingCache.delete(key); return null; }
+  return hit.value;
+}
+
+function groundingCacheSet(key, value) {
+  groundingCache.set(key, { at: Date.now(), value });
+}
+
+const GROUNDING_MAX_RETRIES     = Number(process.env.GROUNDING_MAX_RETRIES     ?? 1);
+const GROUNDING_RETRY_DELAY_MS  = Number(process.env.GROUNDING_RETRY_DELAY_MS  ?? 5_000);
+const GROUNDING_RETRY_CAP_MS    = 15_000; 
+const GROUNDING_COOLDOWN_MS     = Number(process.env.GROUNDING_COOLDOWN_MS     ?? 15_000);
+const GROUNDING_COOLDOWN_MAX_MS = 5 * 60_000;
+let groundingCooldownUntil = 0;
+
+function groundingOnCooldown() {
+  return Date.now() < groundingCooldownUntil;
+}
+
+function startGroundingCooldown(ms = GROUNDING_COOLDOWN_MS) {
+  groundingCooldownUntil = Date.now() + Math.min(Math.max(ms, 0), GROUNDING_COOLDOWN_MAX_MS);
+}
+
+function isRateLimit(err) {
+  return err?.status === 429 ||
+    /\b429\b|quota|RESOURCE_EXHAUSTED|rate.?limit|too many requests/i.test(err?.message || '');
+}
+
+function parseRetryDelayMs(err) {
+  let secStr = null;
+  const details = err?.errorDetails;
+  if (Array.isArray(details)) {
+    const ri = details.find(d => typeof d?.['@type'] === 'string' && d['@type'].includes('RetryInfo'));
+    if (ri?.retryDelay) secStr = String(ri.retryDelay);
+  }
+  if (!secStr && err?.message) {
+    const m = err.message.match(/retryDelay["\s:=]+"?(\d+(?:\.\d+)?)s/i);
+    if (m) secStr = m[1];
+  }
+  if (!secStr) return null;
+  const n = parseFloat(secStr);
+  return Number.isFinite(n) ? Math.round(n * 1000) : null;
+}
+
+function groundingTurnedOff(modelId) {
+  return !modelId || /^(off|none|no|disable[d]?|false)$/i.test(String(modelId).trim());
+}
+
+function extractSources(resp) {
+  const meta = resp?.candidates?.[0]?.groundingMetadata;
+  if (!meta) return [];
+  const chunks = meta.groundingChunks || meta.groundingChuncks || [];
+  const seen = new Set();
+  const out = [];
+  for (const c of chunks) {
+    const web = c && c.web;
+    if (!web || !web.uri || seen.has(web.uri)) continue;
+    seen.add(web.uri);
+    out.push({ title: web.title || web.uri, uri: web.uri });
+  }
+  return out;
+}
+
+function createAiHelper(apiKey, modelId, groundingModelId) {
   const genAI = new GoogleGenerativeAI(apiKey);
   const model = genAI.getGenerativeModel({
     model: modelId,
     generationConfig: { temperature: 0.3, maxOutputTokens: 2048 },
   });
 
-  // Raw prompt -> text. Reuses the same 503/500/network backoff as generation.
+  const groundModelId = groundingModelId || GROUNDING_MODEL;
+  let groundModel = null;
+  let groundingDisabled = groundingTurnedOff(groundingModelId); // also flips on if proven unsupported
+  function getGroundModel() {
+    if (!groundModel) {
+      groundModel = genAI.getGenerativeModel({
+        model: groundModelId,
+        generationConfig: { temperature: 0.2, maxOutputTokens: 2048 },
+      });
+    }
+    return groundModel;
+  }
+
   async function generate(prompt) {
     if (!prompt || typeof prompt !== 'string') {
       throw new Error('ai.generate(prompt): prompt must be a non-empty string.');
     }
-    const result = await callWithRetry(model, prompt);
+    const result = await callWithRetry(model, prompt, AI_DELAYS);
     return (result.response.text() || '').trim();
   }
 
-  // Summarize a string or any JSON-serializable value. Optional instruction lets
-  // the crawler steer it ("one sentence", "extract sentiment", "bullet points").
   async function summarize(input, instruction) {
     const text = typeof input === 'string' ? input : JSON.stringify(input);
     if (!text || !text.trim()) return '';
     const ask = (instruction && String(instruction).trim()) ||
       'Summarize the following content in 2-3 concise sentences. Return plain text only, no preamble.';
-    // Cap input so a huge page body can't blow the token budget.
-    return generate(`${ask}\n\n--- CONTENT START ---\n${text.slice(0, 24000)}\n--- CONTENT END ---`);
+    try {
+      return await generate(`${ask}\n\n--- CONTENT START ---\n${text.slice(0, 24000)}\n--- CONTENT END ---`);
+    } catch (e) {
+      console.warn('[ai.summarize] failed, returning empty summary:', e.message);
+      return '';
+    }
   }
 
-  return { generate, summarize };
+  async function research(query, instruction) {
+    const q = typeof query === 'string' ? query.trim() : '';
+    if (!q) return { text: '', sources: [], grounded: false };
+
+    const cacheKey = `${groundModelId}\n${instruction || ''}\n${q}`;
+    const cached = groundingCacheGet(cacheKey);
+    if (cached) return cached;
+
+    const prompt = instruction
+      ? `${instruction}\n\nQuestion: ${q}`
+      : q;
+
+    if (!groundingDisabled && !groundingOnCooldown()) {
+      const toolVariants = [
+        [{ googleSearch: {} }],
+        [{ googleSearchRetrieval: { dynamicRetrievalConfig: { mode: 'MODE_DYNAMIC', dynamicThreshold: 0.3 } } }],
+      ];
+      let rlRetries = GROUNDING_MAX_RETRIES; // quick retries reserved for 429s
+
+      // Outer loop lets a 429 retry the whole grounded attempt after a short,
+      // server-suggested wait, instead of giving up (or pausing) immediately.
+      attemptLoop:
+      while (true) {
+        let allUnsupported = true; // only disable if EVERY failure was "unsupported"
+        for (const tools of toolVariants) {
+          try {
+            const result = await callWithRetry(
+              getGroundModel(),
+              { contents: [{ role: 'user', parts: [{ text: prompt }] }], tools },
+              AI_DELAYS,
+            );
+            const value = {
+              text: (result.response.text() || '').trim(),
+              sources: extractSources(result.response),
+              grounded: true,
+            };
+            groundingCacheSet(cacheKey, value);
+            return value;
+          } catch (e) {
+            console.warn(`[ai.research] grounded attempt failed (${e.status || 'err'}): ${e.message}`);
+
+            if (isRateLimit(e)) {
+              const serverDelay = parseRetryDelayMs(e);
+              if (rlRetries > 0) {
+                rlRetries--;
+                const waitMs = Math.min(serverDelay ?? GROUNDING_RETRY_DELAY_MS, GROUNDING_RETRY_CAP_MS);
+                console.warn(`[ai.research] rate limited (429); retrying grounding in ${Math.round(waitMs / 1000)}s${serverDelay != null ? ' (server-suggested)' : ''}.`);
+                await new Promise(r => setTimeout(r, waitMs));
+                continue attemptLoop;
+              }
+              const cd = Math.max(serverDelay ?? 0, GROUNDING_COOLDOWN_MS);
+              startGroundingCooldown(cd);
+              console.warn(`[ai.research] still rate limited after retries; pausing grounding ~${Math.round(Math.min(cd, GROUNDING_COOLDOWN_MAX_MS) / 1000)}s and continuing ungrounded.`);
+              return { text: '', sources: [], grounded: false };
+            }
+
+            const unsupported = e.status === 400 || /tool|googleSearch|not supported|invalid|function calling/i.test(e.message || '');
+            if (!unsupported) { allUnsupported = false; break; }
+          }
+        }
+        if (allUnsupported) {
+          groundingDisabled = true;
+          console.warn('[ai.research] grounding unsupported for this model; using ungrounded answers from now on.');
+        }
+        break;
+      }
+    }
+
+    try {
+      const text = await generate(prompt);
+      const value = { text, sources: [], grounded: false };
+      groundingCacheSet(cacheKey, value);
+      return value;
+    } catch (e) {
+      console.warn('[ai.research] ungrounded fallback failed:', e.message);
+      return { text: '', sources: [], grounded: false };
+    }
+  }
+
+  return { generate, summarize, research };
 }
 
-// Fallback used when a stored crawler has no API key available to re-run with
-// (e.g. created before keys were stored). Any AI call surfaces a clear message
-// instead of an opaque "ai is not defined".
 function makeUnavailableAi() {
   const fail = async () => {
     throw new Error('AI helper unavailable: no API key is stored for this crawler. Regenerate it to enable summarization.');
   };
-  return { generate: fail, summarize: fail };
+  return {
+    generate: fail,
+    summarize: async () => '',
+    research: async () => ({ text: '', sources: [], grounded: false }),
+  };
 }
 
-// ── Crawler executor ──────────────────────────────────────────────────────────
-// NOTE: AsyncFunction runs in the module scope (not sandboxed). Fine for a POC;
-// for production, replace with isolated-vm or a Worker thread.
 async function runCrawler(code, ai) {
   const AsyncFn = Object.getPrototypeOf(async function () {}).constructor;
   const fn = new AsyncFn('axios', 'cheerio', 'ai', code);
   return fn(axios, cheerio, ai || makeUnavailableAi());
 }
 
-// AI summarization makes crawls slower, so the timeout is generous.
 function runCrawlerWithTimeout(code, ai, ms = 60_000) {
   return Promise.race([
     runCrawler(code, ai),
@@ -262,14 +429,13 @@ function runCrawlerWithTimeout(code, ai, ms = 60_000) {
   ]);
 }
 
-// ── Verification: does the crawler actually return usable data? ─────────────────
-// Metadata-only keys don't count as "real" data — an empty crawl often still
-// returns these, so we ignore them when judging emptiness.
 const META_KEYS = new Set([
   'scrapedat', 'timestamp', 'updatedat', 'fetchedat', 'lastupdated',
   'error', 'source', 'url', 'status', 'ok', 'success',
   'totalfound', 'total', 'count', 'length', 'page',
 ]);
+
+const DERIVED_KEYS = new Set(['summary', 'summaries', 'sources', 'citations', 'analysis', 'insights']);
 
 function isEffectivelyEmpty(data) {
   if (data === null || data === undefined) return true;
@@ -279,7 +445,8 @@ function isEffectivelyEmpty(data) {
   if (typeof data !== 'object') return false;
 
   for (const [k, v] of Object.entries(data)) {
-    if (META_KEYS.has(k.toLowerCase())) continue;
+    const lk = k.toLowerCase();
+    if (META_KEYS.has(lk) || DERIVED_KEYS.has(lk)) continue;
     if (Array.isArray(v)) { if (v.length > 0) return false; }
     else if (v && typeof v === 'object') { if (Object.keys(v).length > 0) return false; }
     else if (typeof v === 'string') { if (v.trim().length > 0) return false; }
@@ -288,7 +455,16 @@ function isEffectivelyEmpty(data) {
   return true;
 }
 
-// Run the generated crawler and classify the outcome.
+const BLOCK_RE = /\b40[13]\b|forbidden|access denied|unauthorized|blocked|captcha|cloudflare|are you a robot|enable javascript|request failed with status code 40[13]|failed to fetch|could not (?:load|fetch|retrieve)/i;
+
+function looksBlocked(data) {
+  if (data === null || data === undefined) return false;
+  let s;
+  try { s = typeof data === 'string' ? data : JSON.stringify(data); }
+  catch { return false; }
+  return BLOCK_RE.test(s || '');
+}
+
 async function validateCrawler(code, ai) {
   let data;
   try {
@@ -307,6 +483,13 @@ async function validateCrawler(code, ai) {
     };
   }
 
+  if (looksBlocked(data)) {
+    return {
+      ok: false, data, reason: 'blocked',
+      feedback: `The target BLOCKED the request (403 / bot-protection / "access denied" signature in the result). axios cannot bypass Cloudflare, login walls, or bot protection. Do NOT scrape consumer sites like FlightRadar24, FlightAware, Google Flights, or airport pages. Instead use a PUBLIC, key-free JSON API. For flights near a location use https://api.adsb.lol/v2/lat/{lat}/lon/{lon}/dist/{nauticalMiles} or https://api.airplanes.live/v2/point/{lat}/{lon}/{radiusNm} (both return JSON with an "ac" array of live aircraft). Return real, populated data from such an API.`,
+    };
+  }
+
   if (isEffectivelyEmpty(data)) {
     return {
       ok: false, data, reason: 'empty',
@@ -317,30 +500,24 @@ async function validateCrawler(code, ai) {
   return { ok: true, data, reason: 'ok' };
 }
 
-// ── Generate + self-verify, regenerating with feedback until it works ──────────
 const MAX_GEN_ATTEMPTS = 3;
 
-async function generateAndValidate(model, description, ai) {
+async function generateAndValidate(model, description, ai, sourceHint) {
   let feedback = null;
   let lastGood = null; // most recent parseable attempt (sections + validation)
 
   for (let attempt = 1; attempt <= MAX_GEN_ATTEMPTS; attempt++) {
     console.log(`[Generate] Attempt ${attempt}/${MAX_GEN_ATTEMPTS}${feedback ? ' (with fix feedback)' : ''}…`);
 
-    // Call the model. Transport/API errors (overload, internal error, network,
-    // auth, quota) are NOT fixable by re-prompting — callWithRetry already backed
-    // off on the transient ones, so propagate to the route for a precise message
-    // instead of burning attempts with misleading "fix your format" feedback.
     let rawText;
     try {
-      const result = await callWithRetry(model, buildPrompt(description, feedback));
+      const result = await callWithRetry(model, buildPrompt(description, feedback, sourceHint));
       rawText = result.response.text();
     } catch (apiErr) {
       console.error(`[Generate] Attempt ${attempt} API call failed: ${apiErr.message}`);
       throw apiErr;
     }
 
-    // Parsing / format failures ARE retryable via re-prompting.
     let sections;
     try {
       sections = parseSections(rawText);
@@ -360,20 +537,37 @@ async function generateAndValidate(model, description, ai) {
     feedback = validation.feedback;
   }
 
-  // Exhausted attempts — return the last usable generation, flagged unverified
   if (lastGood) {
     return { sections: lastGood.sections, validation: lastGood.validation, attempts: MAX_GEN_ATTEMPTS, verified: false };
   }
   throw new Error('Could not produce a valid crawler after multiple attempts. Try rephrasing or a different model.');
 }
 
-// Default generation model. Users can override this from the UI.
+async function discoverSource(description, ai) {
+  if (!ai || typeof ai.research !== 'function') return null;
+  const instruction =
+    'You are helping a backend engineer pick a data source for a Node.js crawler that uses only axios (no browser, no JavaScript execution) and an optional API key the user already has. ' +
+    'Recommend the single best PUBLIC, no-auth (or widely-free) JSON/REST API endpoint that currently returns the requested data. ' +
+    'Give the concrete base URL and an example request path, the key response fields to read, and any required headers. ' +
+    'Avoid sites that require login, heavy bot protection, or client-side JavaScript rendering. Keep it under 120 words.';
+  try {
+    const { text, sources, grounded } = await ai.research(description, instruction);
+    if (!text || !text.trim()) return null;
+    console.log(`[discoverSource] ${grounded ? 'grounded' : 'ungrounded'} hint (${sources.length} source${sources.length === 1 ? '' : 's'}).`);
+    return { text: text.trim(), sources: sources || [], grounded: !!grounded };
+  } catch (e) {
+    console.warn('[discoverSource] failed, proceeding without a hint:', e.message);
+    return null;
+  }
+}
+
 const DEFAULT_MODEL = 'gemma-4-31b-it';
 
 // ── POST /api/generate ─────────────────────────────────────────────────────────
 app.post('/api/generate', async (req, res) => {
-  const { apiKey, description, model: modelName } = req.body ?? {};
+  const { apiKey, description, model: modelName, groundingModel: groundingName } = req.body ?? {};
   const modelId = modelName?.trim() || DEFAULT_MODEL;
+  const groundingModelId = groundingName?.trim() || GROUNDING_MODEL;
 
   if (!apiKey?.trim())       return res.status(400).json({ error: 'Gemini API key is required.' });
   if (!description?.trim())  return res.status(400).json({ error: 'A monitoring description is required.' });
@@ -385,22 +579,18 @@ app.post('/api/generate', async (req, res) => {
       systemInstruction: SYSTEM_INSTRUCTION,
       generationConfig: {
         temperature: 0.2,
-        // Note: responseMimeType intentionally omitted — we use a delimiter
-        // format (parseSections), not JSON, so the model never has to escape
-        // the crawler/HTML content.
         maxOutputTokens: 65536,
       },
     });
 
-    // AI helper handed to the generated crawler so it can summarize / extract
-    // with Gemini at crawl time.
-    const aiHelper = createAiHelper(apiKey.trim(), modelId);
+    const aiHelper = createAiHelper(apiKey.trim(), modelId, groundingModelId);
 
-    // Generate, then actually RUN the crawler to verify it works — regenerating
-    // with targeted feedback (up to MAX_GEN_ATTEMPTS) if it errors or returns
-    // no usable data.
+    const sourceHint = groundingTurnedOff(groundingModelId)
+      ? null
+      : await discoverSource(description.trim(), aiHelper);
+
     const { sections, validation, attempts, verified } =
-      await generateAndValidate(model, description.trim(), aiHelper);
+      await generateAndValidate(model, description.trim(), aiHelper, sourceHint ? sourceHint.text : null);
 
     const crawlerId = crypto.randomUUID();
     const dashboardHtml = sections.dashboardHtml.replaceAll('{{CRAWLER_ID}}', crawlerId);
@@ -411,11 +601,9 @@ app.post('/api/generate', async (req, res) => {
       description: (sections.description || description.trim()).slice(0, 150),
       code:        sections.crawlerCode,
       dashboardHtml,
-      // Stored so /api/crawl/:id re-runs can rebuild the AI helper. POC-only:
-      // keeping the key in memory is acceptable here; it is never sent to clients
-      // (see GET /api/crawlers, which omits it).
-      apiKey:      apiKey.trim(),
-      model:       modelId,
+      apiKey:         apiKey.trim(),
+      model:          modelId,
+      groundingModel: groundingModelId,
       createdAt:   new Date().toISOString(),
       lastRun:     validation.ok ? new Date().toISOString() : null,
       lastResult:  validation.ok ? validation.data : null,
@@ -429,6 +617,8 @@ app.post('/api/generate', async (req, res) => {
       : `Could not verify after ${attempts} attempts (${validation.reason}). The dashboard may show no data.` +
         (validation.reason === 'empty'
           ? ' The target is likely JavaScript-rendered — try a source that exposes a public API.'
+          : validation.reason === 'blocked'
+          ? ' The target blocked the request (bot protection) — try a source that exposes a public API.'
           : '');
 
     return res.json({
@@ -440,6 +630,8 @@ app.post('/api/generate', async (req, res) => {
       attempts,
       verifyReason: validation.reason,
       verifyNote,
+      grounded:     sourceHint ? sourceHint.grounded : false,
+      sources:      sourceHint ? sourceHint.sources : [],
       initialData:  validation.data ?? null,
       initialError: verified ? null : validation.feedback,
     });
@@ -470,9 +662,7 @@ app.get('/api/crawl/:id', async (req, res) => {
   if (!entry) return res.status(404).json({ success: false, error: 'Crawler not found.' });
 
   try {
-    // Rebuild the AI helper from the key stored at creation time so the crawler
-    // can summarize on every refresh, not just the first run.
-    const ai = entry.apiKey ? createAiHelper(entry.apiKey, entry.model) : makeUnavailableAi();
+    const ai = entry.apiKey ? createAiHelper(entry.apiKey, entry.model, entry.groundingModel) : makeUnavailableAi();
     const data = await runCrawlerWithTimeout(entry.code, ai, 60_000);
     entry.lastResult = data;
     entry.lastRun    = new Date().toISOString();
