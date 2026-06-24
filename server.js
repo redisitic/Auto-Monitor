@@ -339,10 +339,7 @@ function createAiHelper(apiKey, modelId, groundingModelId) {
         [{ googleSearch: {} }],
         [{ googleSearchRetrieval: { dynamicRetrievalConfig: { mode: 'MODE_DYNAMIC', dynamicThreshold: 0.3 } } }],
       ];
-      let rlRetries = GROUNDING_MAX_RETRIES; // quick retries reserved for 429s
-
-      // Outer loop lets a 429 retry the whole grounded attempt after a short,
-      // server-suggested wait, instead of giving up (or pausing) immediately.
+      let rlRetries = GROUNDING_MAX_RETRIES; 
       attemptLoop:
       while (true) {
         let allUnsupported = true; // only disable if EVERY failure was "unsupported"
