@@ -1,10 +1,10 @@
-# POC Monitor
+# Auto-Monitor
 
 AI-powered, on-demand crawler and dashboard generator built on the Google Gemini API.
 
 ## Overview
 
-POC Monitor is a ChatGPT-style web app. You describe what you want to monitor in
+Auto-Monitor is a ChatGPT-style web app. You describe what you want to monitor in
 plain language, and the app uses Gemini to generate two things:
 
 1. A working JavaScript web crawler.
@@ -19,15 +19,19 @@ you always know whether the crawler was confirmed working.
 ## Features
 
 - Natural-language generation of both a crawler and a live dashboard.
+- AI summarization built in: each generated crawler receives a Gemini-backed `ai`
+  helper, so monitors can summarize, extract, or classify the content they scrape
+  (for example "summarize today's top stories"). Summaries are produced on every
+  refresh, not just the first run.
 - Self-verification loop: the crawler is executed, and on failure it is regenerated
   with targeted feedback (up to 3 attempts).
-- Configurable model: set any Gemini model name from the UI. Defaults to
-  `gemma-4-31b-it`.
+- Configurable model: set any model name available on your API key from the UI.
+  Defaults to `gemma-4-31b-it`.
 - Live dashboards that auto-refresh every 60 seconds with a manual refresh button.
 - Dark themed, single-page chat interface.
 - Your API key is supplied from the browser and is never hard-coded into the app.
-- Automatic retry with exponential backoff when the model is temporarily overloaded
-  (HTTP 503).
+- Automatic retry with exponential backoff on transient API failures (HTTP 503
+  overload, HTTP 500 internal errors, and network or fetch failures).
 
 ## Prerequisites
 
@@ -91,8 +95,12 @@ Then open http://localhost:3000 in your browser.
   output is always the final block, so anchoring on the last occurrence skips the
   noise.
 - Crawler execution: generated code runs as an async function body via the
-  AsyncFunction constructor, with `axios` and `cheerio` provided in scope and a hard
-  timeout to prevent runaway crawls.
+  AsyncFunction constructor, with `axios`, `cheerio`, and an `ai` helper provided in
+  scope and a hard timeout to prevent runaway crawls.
+- AI helper: the injected `ai` object exposes `await ai.summarize(textOrObject, instruction?)`
+  and `await ai.generate(prompt)`, both backed by Gemini using the same API key and
+  model. The key is stored with the crawler server-side so re-runs from the dashboard
+  can summarize too. It is never returned to the browser.
 - Verification: after running, the result is checked for thrown errors, an internal
   error field, or effectively empty output. Metadata-only keys such as `scrapedAt` do
   not count as real data.
@@ -126,5 +134,8 @@ This project is a proof of concept and is not hardened for production:
 - There is no authentication. Anyone who can reach the server can generate and run
   crawlers.
 - Crawler data is stored in memory only and is lost on restart.
+- To support summarization on dashboard refreshes, each crawler's API key is held in
+  memory server-side. It is never sent to the browser, but it does live in process
+  memory until restart. Do not run this on an untrusted host.
 
 Use it for experimentation and demos, not for untrusted public exposure.

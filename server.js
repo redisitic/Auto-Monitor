@@ -27,6 +27,16 @@ Given a user request about what to monitor, generate two things:
 • Available identifiers already in scope (do NOT require/import them):
     - axios   → HTTP client  (e.g. const r = await axios.get(url, { headers: {...} }))
     - cheerio → HTML parser  (e.g. const $ = cheerio.load(r.data))
+    - ai      → Gemini AI helper for summarizing / extracting / classifying scraped text:
+                  await ai.summarize(textOrObject)                  → short plain-text summary
+                  await ai.summarize(text, "one sentence, neutral") → summary guided by your instruction
+                  await ai.generate("any prompt ...")               → raw model text response
+                Both are ASYNC — always await them. Use ai ONLY when the request needs
+                summarization/analysis (e.g. "summarize today's news"). If asked to summarize,
+                attach the result to your data (e.g. item.summary = await ai.summarize(item.body)).
+                PERFORMANCE: prefer ONE batched ai call over many. Summarize a combined digest, or
+                cap per-item summaries to the first ~8 items. Wrap every ai call in try/catch so an
+                AI hiccup never kills the whole crawl.
 • The code MUST end with:  return { ...yourData, scrapedAt: new Date().toISOString() }
 • All returned values must be JSON-serializable (strings, numbers, plain objects, arrays).
 • Prefer official JSON/REST APIs over HTML scraping when available.
@@ -58,6 +68,7 @@ Given a user request about what to monitor, generate two things:
 • Primary text #f0f0f0 · secondary text #888888.
 • Rounded corners (8px), subtle shadows, clean professional layout.
 • Use CSS Grid or Flexbox. Make the layout responsive.
+• If the data contains a "summary" field (or per-item "summary"), display it prominently in a highlighted panel/card so the AI summary is the first thing the user sees.
 • KEEP OUTPUT COMPACT: no decorative comments, no unnecessary blank lines, minimal whitespace in HTML/CSS. Every token counts.`;
 
 // ── Prompt template (delimiter-based, NOT JSON) ────────────────────────────────
@@ -168,11 +179,17 @@ async function callWithRetry(model, prompt) {
     try {
       return await model.generateContent(prompt);
     } catch (err) {
-      const is503 = err.status === 503 ||
-        /503|Service Unavailable|overloaded|high demand/i.test(err.message ?? '');
-      if (is503 && attempt < MAX_RETRIES) {
+      const msg = err.message ?? '';
+      // Retry transient server/network failures: 503 (overloaded), 500
+      // (internal error), and low-level fetch/connection errors. Do NOT retry
+      // auth (401/403), quota (429), or model-not-found (404) — those are not
+      // going to fix themselves.
+      const transient =
+        err.status === 503 || err.status === 500 ||
+        /\b50[03]\b|Service Unavailable|overloaded|high demand|Internal error|fetch failed|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|network/i.test(msg);
+      if (transient && attempt < MAX_RETRIES) {
         const delay = DELAYS[attempt];
-        console.log(`[Retry ${attempt + 1}/${MAX_RETRIES}] Model overloaded — waiting ${delay / 1000}s…`);
+        console.log(`[Retry ${attempt + 1}/${MAX_RETRIES}] Transient API failure (${err.status || 'network'}) — waiting ${delay / 1000}s…`);
         await new Promise(r => setTimeout(r, delay));
         continue;
       }
@@ -181,18 +198,65 @@ async function callWithRetry(model, prompt) {
   }
 }
 
+// ── Gemini AI helper exposed to generated crawlers ─────────────────────────────
+// Generated crawlers run with `axios`, `cheerio`, and this `ai` object in scope.
+// It lets a crawler call Gemini to summarize / extract / classify the content it
+// scrapes (the user's "summarizing agent"). It deliberately uses NO
+// systemInstruction so it works with any model the user picked, and caps output
+// so summaries stay fast and cheap.
+function createAiHelper(apiKey, modelId) {
+  const genAI = new GoogleGenerativeAI(apiKey);
+  const model = genAI.getGenerativeModel({
+    model: modelId,
+    generationConfig: { temperature: 0.3, maxOutputTokens: 2048 },
+  });
+
+  // Raw prompt -> text. Reuses the same 503/500/network backoff as generation.
+  async function generate(prompt) {
+    if (!prompt || typeof prompt !== 'string') {
+      throw new Error('ai.generate(prompt): prompt must be a non-empty string.');
+    }
+    const result = await callWithRetry(model, prompt);
+    return (result.response.text() || '').trim();
+  }
+
+  // Summarize a string or any JSON-serializable value. Optional instruction lets
+  // the crawler steer it ("one sentence", "extract sentiment", "bullet points").
+  async function summarize(input, instruction) {
+    const text = typeof input === 'string' ? input : JSON.stringify(input);
+    if (!text || !text.trim()) return '';
+    const ask = (instruction && String(instruction).trim()) ||
+      'Summarize the following content in 2-3 concise sentences. Return plain text only, no preamble.';
+    // Cap input so a huge page body can't blow the token budget.
+    return generate(`${ask}\n\n--- CONTENT START ---\n${text.slice(0, 24000)}\n--- CONTENT END ---`);
+  }
+
+  return { generate, summarize };
+}
+
+// Fallback used when a stored crawler has no API key available to re-run with
+// (e.g. created before keys were stored). Any AI call surfaces a clear message
+// instead of an opaque "ai is not defined".
+function makeUnavailableAi() {
+  const fail = async () => {
+    throw new Error('AI helper unavailable: no API key is stored for this crawler. Regenerate it to enable summarization.');
+  };
+  return { generate: fail, summarize: fail };
+}
+
 // ── Crawler executor ──────────────────────────────────────────────────────────
 // NOTE: AsyncFunction runs in the module scope (not sandboxed). Fine for a POC;
 // for production, replace with isolated-vm or a Worker thread.
-async function runCrawler(code) {
+async function runCrawler(code, ai) {
   const AsyncFn = Object.getPrototypeOf(async function () {}).constructor;
-  const fn = new AsyncFn('axios', 'cheerio', code);
-  return fn(axios, cheerio);
+  const fn = new AsyncFn('axios', 'cheerio', 'ai', code);
+  return fn(axios, cheerio, ai || makeUnavailableAi());
 }
 
-function runCrawlerWithTimeout(code, ms = 30_000) {
+// AI summarization makes crawls slower, so the timeout is generous.
+function runCrawlerWithTimeout(code, ai, ms = 60_000) {
   return Promise.race([
-    runCrawler(code),
+    runCrawler(code, ai),
     new Promise((_, rej) =>
       setTimeout(() => rej(new Error(`Crawl timed out (${Math.round(ms / 1000)} s)`)), ms)),
   ]);
@@ -225,10 +289,10 @@ function isEffectivelyEmpty(data) {
 }
 
 // Run the generated crawler and classify the outcome.
-async function validateCrawler(code) {
+async function validateCrawler(code, ai) {
   let data;
   try {
-    data = await runCrawlerWithTimeout(code, 25_000);
+    data = await runCrawlerWithTimeout(code, ai, 50_000);
   } catch (e) {
     return {
       ok: false, data: null, reason: 'threw',
@@ -256,25 +320,37 @@ async function validateCrawler(code) {
 // ── Generate + self-verify, regenerating with feedback until it works ──────────
 const MAX_GEN_ATTEMPTS = 3;
 
-async function generateAndValidate(model, description) {
+async function generateAndValidate(model, description, ai) {
   let feedback = null;
   let lastGood = null; // most recent parseable attempt (sections + validation)
 
   for (let attempt = 1; attempt <= MAX_GEN_ATTEMPTS; attempt++) {
     console.log(`[Generate] Attempt ${attempt}/${MAX_GEN_ATTEMPTS}${feedback ? ' (with fix feedback)' : ''}…`);
 
-    let sections;
+    // Call the model. Transport/API errors (overload, internal error, network,
+    // auth, quota) are NOT fixable by re-prompting — callWithRetry already backed
+    // off on the transient ones, so propagate to the route for a precise message
+    // instead of burning attempts with misleading "fix your format" feedback.
+    let rawText;
     try {
       const result = await callWithRetry(model, buildPrompt(description, feedback));
-      sections = parseSections(result.response.text());
+      rawText = result.response.text();
+    } catch (apiErr) {
+      console.error(`[Generate] Attempt ${attempt} API call failed: ${apiErr.message}`);
+      throw apiErr;
+    }
+
+    // Parsing / format failures ARE retryable via re-prompting.
+    let sections;
+    try {
+      sections = parseSections(rawText);
     } catch (e) {
-      // Parsing / format failure is itself retryable
       feedback = `Your previous response could not be used: ${e.message} Follow the exact section format with ===NAME===, ===DESCRIPTION===, ===CRAWLER===, ===DASHBOARD===.`;
       console.warn(`[Generate] Attempt ${attempt} parse failed: ${e.message}`);
       continue;
     }
 
-    const validation = await validateCrawler(sections.crawlerCode);
+    const validation = await validateCrawler(sections.crawlerCode, ai);
     lastGood = { sections, validation };
     console.log(`[Generate] Attempt ${attempt} verification: ${validation.ok ? 'PASS' : 'FAIL (' + validation.reason + ')'}`);
 
@@ -291,6 +367,7 @@ async function generateAndValidate(model, description) {
   throw new Error('Could not produce a valid crawler after multiple attempts. Try rephrasing or a different model.');
 }
 
+// Default generation model. Users can override this from the UI.
 const DEFAULT_MODEL = 'gemma-4-31b-it';
 
 // ── POST /api/generate ─────────────────────────────────────────────────────────
@@ -315,11 +392,15 @@ app.post('/api/generate', async (req, res) => {
       },
     });
 
+    // AI helper handed to the generated crawler so it can summarize / extract
+    // with Gemini at crawl time.
+    const aiHelper = createAiHelper(apiKey.trim(), modelId);
+
     // Generate, then actually RUN the crawler to verify it works — regenerating
     // with targeted feedback (up to MAX_GEN_ATTEMPTS) if it errors or returns
     // no usable data.
     const { sections, validation, attempts, verified } =
-      await generateAndValidate(model, description.trim());
+      await generateAndValidate(model, description.trim(), aiHelper);
 
     const crawlerId = crypto.randomUUID();
     const dashboardHtml = sections.dashboardHtml.replaceAll('{{CRAWLER_ID}}', crawlerId);
@@ -330,6 +411,11 @@ app.post('/api/generate', async (req, res) => {
       description: (sections.description || description.trim()).slice(0, 150),
       code:        sections.crawlerCode,
       dashboardHtml,
+      // Stored so /api/crawl/:id re-runs can rebuild the AI helper. POC-only:
+      // keeping the key in memory is acceptable here; it is never sent to clients
+      // (see GET /api/crawlers, which omits it).
+      apiKey:      apiKey.trim(),
+      model:       modelId,
       createdAt:   new Date().toISOString(),
       lastRun:     validation.ok ? new Date().toISOString() : null,
       lastResult:  validation.ok ? validation.data : null,
@@ -384,7 +470,10 @@ app.get('/api/crawl/:id', async (req, res) => {
   if (!entry) return res.status(404).json({ success: false, error: 'Crawler not found.' });
 
   try {
-    const data = await runCrawlerWithTimeout(entry.code, 30_000);
+    // Rebuild the AI helper from the key stored at creation time so the crawler
+    // can summarize on every refresh, not just the first run.
+    const ai = entry.apiKey ? createAiHelper(entry.apiKey, entry.model) : makeUnavailableAi();
+    const data = await runCrawlerWithTimeout(entry.code, ai, 60_000);
     entry.lastResult = data;
     entry.lastRun    = new Date().toISOString();
     entry.lastError  = null;
